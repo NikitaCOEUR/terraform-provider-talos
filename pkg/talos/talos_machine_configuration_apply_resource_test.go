@@ -48,6 +48,44 @@ func TestAccTalosMachineConfigurationApplyResource(t *testing.T) {
 	})
 }
 
+func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
+	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+
+	resource.ParallelTest(t, resource.TestCase{
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"libvirt": {
+				Source:            "dmacvicar/libvirt",
+				VersionConstraint: "= 0.8.3",
+			},
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			// Step 1: Initial creation with apply_mode = "auto_staged"
+			// During creation, the node doesn't exist during plan phase, so dry-run cannot be performed
+			// Therefore, resolved_apply_mode = "auto" (no reboot prevention on initial creation)
+			{
+				Config: testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged("talos", rName, "v1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "id", "machine_configuration_apply"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "apply_mode", "auto_staged"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "resolved_apply_mode", "auto"),
+				),
+			},
+			// Step 2: Update configuration (change that would require reboot)
+			// Now the node exists, dry-run can be performed during plan phase
+			// If reboot is needed, resolved_apply_mode should be "staged" by the provider
+			{
+				Config: testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged("talos", rName, "v2"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "id", "machine_configuration_apply"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "apply_mode", "auto_staged"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.auto_staged", "resolved_apply_mode", "staged"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccTalosMachineConfigurationApplyResourceUpgrade(t *testing.T) {
 	// ref: https://github.com/hashicorp/terraform-plugin-testing/pull/118
 	t.Skip("skipping until TF test framework has a way to remove state resource")
@@ -145,4 +183,44 @@ func testAccTalosMachineConfigurationApplyResourceConfigV1(providerName, rName s
 	}
 
 	return config.render()
+}
+
+func testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged(providerName, rName, version string) string {
+	config := dynamicConfig{
+		Provider:        providerName,
+		ResourceName:    rName,
+		WithApplyConfig: true,
+		WithBootstrap:   false,
+	}
+
+	baseConfig := config.render()
+
+	// Different content for v1 and v2 to trigger a configuration change
+	content := "example: configuration v1"
+	if version == "v2" {
+		content = "example: configuration v2 - updated"
+	}
+
+	return baseConfig + `
+resource "talos_machine_configuration_apply" "auto_staged" {
+  client_configuration        = talos_machine_secrets.this.client_configuration
+  machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
+  node                        = libvirt_domain.cp.network_interface[0].addresses[0]
+  apply_mode                  = "auto_staged"
+  config_patches = [
+    yamlencode({
+      machine = {
+        files = [
+          {
+            path        = "/var/etc/example-config.yaml"
+            permissions = 420  # 0644 in octal
+            op          = "create"
+            content     = "` + content + `"
+          }
+        ]
+      }
+    }),
+  ]
+}
+`
 }
