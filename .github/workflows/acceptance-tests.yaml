@@ -5,14 +5,14 @@ concurrency:
 on:
   pull_request:
     paths:
-      - 'go.mod'
-      - 'go.sum'
-      - '**.go'
+      - "go.mod"
+      - "go.sum"
+      - "**.go"
+
 jobs:
   acc-tests:
     if: (!startsWith(github.head_ref, 'renovate/') && !startsWith(github.head_ref, 'dependabot/'))
-    runs-on:
-      group: large
+    runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
     steps:
@@ -21,8 +21,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: "go.mod"
           cache: true
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -44,15 +46,16 @@ jobs:
           sudo ln -s OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd
           sudo ln -s OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd
 
-          sudo virtlockd -d
-          sudo virtlogd -d
-          sudo libvirtd -d
+          # Configure libvirt security (disable apparmor/selinux for QEMU)
+          echo 'security_driver = "none"' | sudo tee --append /etc/libvirt/qemu.conf
+
+          # Restart libvirtd to apply security config (may have auto-started during package install)
+          sudo systemctl restart libvirtd || sudo systemctl start libvirtd
           echo -e "<pool type='dir'>\n<name>default</name>\n<target>\n<path>/pool-default</path>\n</target>\n</pool>" > pool.xml
           sudo mkdir /pool-default
           sudo chmod a+rwx /pool-default
           sudo virsh pool-define pool.xml
           sudo virsh pool-start default
-          echo 'security_driver = "none"' | sudo tee --append /etc/libvirt/qemu.conf
           cat <<EOF > net.xml
           <network>
             <name>default</name>

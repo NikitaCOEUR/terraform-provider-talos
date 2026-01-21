@@ -68,11 +68,33 @@ func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
+			// Step 1: Initial config without any config_patches
 			{
-				Config: testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged("talos", rName),
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase("talos", rName),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "id", "machine_configuration_apply"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
+				),
+			},
+			// Step 2: Change hostname (no reboot required) -> "auto"
+			{
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedNoReboot("talos", rName),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "auto"),
+				),
+			},
+			// Step 3: Add file (requires reboot) -> "staged"
+			{
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedWithReboot("talos", rName),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "staged"),
+				),
+			},
+			// Step 4: No change - resolved_apply_mode must remain "staged" (tests the fix)
+			{
+				Config:   testAccTalosMachineConfigurationApplyResourceConfigAutoStagedWithReboot("talos", rName),
+				PlanOnly: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "staged"),
 				),
 			},
@@ -179,7 +201,55 @@ func testAccTalosMachineConfigurationApplyResourceConfigV1(providerName, rName s
 	return config.render()
 }
 
-func testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged(providerName, rName string) string {
+func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(providerName, rName string) string {
+	config := dynamicConfig{
+		Provider:        providerName,
+		ResourceName:    rName,
+		WithApplyConfig: true,
+		WithBootstrap:   false,
+	}
+
+	baseConfig := config.render()
+
+	return baseConfig + `
+resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
+  client_configuration        = talos_machine_secrets.this.client_configuration
+  machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
+  node                        = libvirt_domain.cp.network_interface[0].addresses[0]
+  apply_mode                  = "staged_if_needing_reboot"
+}
+`
+}
+
+func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedNoReboot(providerName, rName string) string {
+	config := dynamicConfig{
+		Provider:        providerName,
+		ResourceName:    rName,
+		WithApplyConfig: true,
+		WithBootstrap:   false,
+	}
+
+	baseConfig := config.render()
+
+	return baseConfig + `
+resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
+  client_configuration        = talos_machine_secrets.this.client_configuration
+  machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
+  node                        = libvirt_domain.cp.network_interface[0].addresses[0]
+  apply_mode                  = "staged_if_needing_reboot"
+  config_patches = [
+    yamlencode({
+      apiVersion = "v1alpha1"
+      kind       = "HostnameConfig"
+      auto       = "off"
+      hostname   = "changedhostname"
+    }),
+  ]
+}
+`
+}
+
+func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedWithReboot(providerName, rName string) string {
 	config := dynamicConfig{
 		Provider:        providerName,
 		ResourceName:    rName,
