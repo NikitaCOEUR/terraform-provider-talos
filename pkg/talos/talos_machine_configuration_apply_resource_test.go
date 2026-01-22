@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 func TestAccTalosMachineConfigurationApplyResource(t *testing.T) {
@@ -70,7 +71,7 @@ func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 		Steps: []resource.TestStep{
 			// Step 1: Initial config without any config_patches
 			{
-				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase("talos", rName),
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(rName, "staged_if_needing_reboot"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "id", "machine_configuration_apply"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
@@ -96,6 +97,104 @@ func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 				PlanOnly: true,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "staged"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccTalosMachineConfigurationApplyResourceAutoStagedUpgrade tests the fix for empty resolved_apply_mode.
+//
+// Bug scenario:
+// 1. v0.10.0: staged_if_needing_reboot and resolved_apply_mode don't exist
+// 2. v0.10.1: add staged_if_needing_reboot, resolved_apply_mode appears but is EMPTY (this is the bug)
+// 3. Current version (no config change): resolved_apply_mode should be computed as "auto" (the fix).
+func TestAccTalosMachineConfigurationApplyResourceAutoStagedUpgrade(t *testing.T) {
+	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+
+	logResourceState := func(stepName string) resource.TestCheckFunc {
+		return func(s *terraform.State) error {
+			rs, ok := s.RootModule().Resources["talos_machine_configuration_apply.staged_if_needing_reboot"]
+			if !ok {
+				t.Logf("[%s] Resource not found in state", stepName)
+
+				return nil
+			}
+
+			t.Logf("[%s] apply_mode = %q", stepName, rs.Primary.Attributes["apply_mode"])
+
+			resolvedApplyMode, exists := rs.Primary.Attributes["resolved_apply_mode"]
+
+			switch {
+			case !exists:
+				t.Logf("[%s] resolved_apply_mode = <DOES NOT EXIST>", stepName)
+			case resolvedApplyMode == "":
+				t.Logf("[%s] resolved_apply_mode = <EMPTY STRING>", stepName)
+			default:
+				t.Logf("[%s] resolved_apply_mode = %q", stepName, resolvedApplyMode)
+			}
+
+			return nil
+		}
+	}
+
+	resource.ParallelTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			// Step 1: v0.10.0 - staged_if_needing_reboot doesn't exist, use default apply_mode
+			{
+				ExternalProviders: map[string]resource.ExternalProvider{
+					"talos": {
+						VersionConstraint: "=0.10.0",
+						Source:            "siderolabs/talos",
+					},
+					"libvirt": {
+						Source:            "dmacvicar/libvirt",
+						VersionConstraint: "= 0.8.3",
+					},
+				},
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(rName, "auto"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					logResourceState("Step 1 - v0.10.0"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "auto"),
+				),
+			},
+			// Step 2: v0.10.1 - switch to staged_if_needing_reboot, resolved_apply_mode may be empty (bug)
+			{
+				ExternalProviders: map[string]resource.ExternalProvider{
+					"talos": {
+						VersionConstraint: "=0.10.1",
+						Source:            "siderolabs/talos",
+					},
+					"libvirt": {
+						Source:            "dmacvicar/libvirt",
+						VersionConstraint: "= 0.8.3",
+					},
+				},
+				Config: testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(rName, "staged_if_needing_reboot"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					logResourceState("Step 2 - v0.10.1 (bug)"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
+					// Bug: resolved_apply_mode is empty here because config didn't change
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", ""),
+				),
+			},
+			// Step 3: Current version (with fix) - no config change, resolved_apply_mode should be computed
+			// Use PlanOnly because staged mode is not supported in maintenance mode.
+			{
+				ExternalProviders: map[string]resource.ExternalProvider{
+					"libvirt": {
+						Source:            "dmacvicar/libvirt",
+						VersionConstraint: "= 0.8.3",
+					},
+				},
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Config:                   testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(rName, "staged_if_needing_reboot"),
+				PlanOnly:                 true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					logResourceState("Step 3 - fix resolved_apply_mode computation first time without config change"),
+					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
+					// Fix: resolved_apply_mode should now be computed (not empty).
+					resource.TestCheckResourceAttrSet("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode"),
 				),
 			},
 		},
@@ -201,9 +300,9 @@ func testAccTalosMachineConfigurationApplyResourceConfigV1(providerName, rName s
 	return config.render()
 }
 
-func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(providerName, rName string) string {
+func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedBase(rName string, applyMode string) string {
 	config := dynamicConfig{
-		Provider:        providerName,
+		Provider:        "talos",
 		ResourceName:    rName,
 		WithApplyConfig: true,
 		WithBootstrap:   false,
@@ -216,7 +315,7 @@ resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
   client_configuration        = talos_machine_secrets.this.client_configuration
   machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
   node                        = libvirt_domain.cp.network_interface[0].addresses[0]
-  apply_mode                  = "staged_if_needing_reboot"
+  apply_mode                  = "` + applyMode + `"
 }
 `
 }
