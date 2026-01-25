@@ -25,6 +25,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/action"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -228,6 +229,16 @@ func (p *talosMachineConfigurationApplyResource) Create(ctx context.Context, req
 
 	effectiveMode := getEffectiveMode(&state)
 
+	// Debug logging for staged_if_needing_reboot investigation
+	tflog.Debug(ctx, "Create: applying configuration",
+		map[string]interface{}{
+			"node":                state.Node.ValueString(),
+			"apply_mode":          state.ApplyMode.ValueString(),
+			"resolved_apply_mode": state.ResolvedApplyMode.ValueString(),
+			"effective_mode":      effectiveMode,
+		},
+	)
+
 	if err := retry.RetryContext(ctxDeadline, createTimeout, func() *retry.RetryError {
 		if err := talosClientOp(ctx, state.Endpoint.ValueString(), state.Node.ValueString(), talosClientConfig, func(nodeCtx context.Context, c *client.Client) error {
 			_, err := c.ApplyConfiguration(nodeCtx, &machineapi.ApplyConfigurationRequest{
@@ -307,6 +318,16 @@ func (p *talosMachineConfigurationApplyResource) Update(ctx context.Context, req
 	defer cancel()
 
 	effectiveMode := getEffectiveMode(&state)
+
+	// Debug logging for staged_if_needing_reboot investigation
+	tflog.Debug(ctx, "Update: applying configuration",
+		map[string]interface{}{
+			"node":                state.Node.ValueString(),
+			"apply_mode":          state.ApplyMode.ValueString(),
+			"resolved_apply_mode": state.ResolvedApplyMode.ValueString(),
+			"effective_mode":      effectiveMode,
+		},
+	)
 
 	if err := retry.RetryContext(ctxDeadline, updateTimeout, func() *retry.RetryError {
 		if err := talosClientOp(ctx, state.Endpoint.ValueString(), state.Node.ValueString(), talosClientConfig, func(nodeCtx context.Context, c *client.Client) error {
@@ -472,7 +493,18 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 		applyMode = "auto"
 	}
 
+	tflog.Debug(ctx, "handleRebootPrevention: starting",
+		map[string]interface{}{
+			"node":       planState.Node.ValueString(),
+			"apply_mode": applyMode,
+			"is_create":  req.State.Raw.IsNull(),
+		},
+	)
+
 	if applyMode != "staged_if_needing_reboot" {
+		tflog.Debug(ctx, "handleRebootPrevention: not staged_if_needing_reboot, using apply_mode directly",
+			map[string]interface{}{"resolved_apply_mode": applyMode},
+		)
 		setResolvedApplyMode(ctx, resp, applyMode)
 
 		return
@@ -480,6 +512,7 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 
 	// Cannot perform dry-run if node address is unknown (computed from another resource)
 	if planState.Node.IsUnknown() {
+		tflog.Debug(ctx, "handleRebootPrevention: node is unknown, defaulting to auto")
 		setResolvedApplyMode(ctx, resp, "auto")
 
 		return
@@ -494,8 +527,19 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 			return
 		}
 
+		configChanged := !currentState.MachineConfiguration.Equal(types.StringValue(string(cfgBytes)))
+		tflog.Debug(ctx, "handleRebootPrevention: checking config change for update",
+			map[string]interface{}{
+				"config_changed":              configChanged,
+				"current_resolved_apply_mode": currentState.ResolvedApplyMode.ValueString(),
+			},
+		)
+
 		if currentState.MachineConfiguration.Equal(types.StringValue(string(cfgBytes))) {
 			if !currentState.ResolvedApplyMode.IsNull() && currentState.ResolvedApplyMode.ValueString() != "" {
+				tflog.Debug(ctx, "handleRebootPrevention: config unchanged, reusing previous resolved_apply_mode",
+					map[string]interface{}{"resolved_apply_mode": currentState.ResolvedApplyMode.ValueString()},
+				)
 				setResolvedApplyMode(ctx, resp, currentState.ResolvedApplyMode.ValueString())
 
 				return
@@ -508,6 +552,13 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 		endpoint = planState.Node.ValueString()
 	}
 
+	tflog.Debug(ctx, "handleRebootPrevention: performing dry-run to check reboot requirement",
+		map[string]interface{}{
+			"node":     planState.Node.ValueString(),
+			"endpoint": endpoint,
+		},
+	)
+
 	talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 		"dynamic",
 		planState.ClientConfiguration.CA.ValueString(),
@@ -515,6 +566,9 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 		planState.ClientConfiguration.Key.ValueString(),
 	)
 	if err != nil {
+		tflog.Debug(ctx, "handleRebootPrevention: failed to create client config, defaulting to auto",
+			map[string]interface{}{"error": err.Error()},
+		)
 		resp.Diagnostics.AddWarning(
 			"Cannot check reboot requirement",
 			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", planState.Node.ValueString(), err),
@@ -525,6 +579,7 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 	}
 
 	var needsReboot bool
+	var dryRunMode string
 
 	err = talosClientOp(ctx, endpoint, planState.Node.ValueString(), talosClientConfig,
 		func(nodeCtx context.Context, c *client.Client) error {
@@ -539,12 +594,16 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 
 			if len(applyResp.Messages) > 0 {
 				needsReboot = (applyResp.Messages[0].Mode == machineapi.ApplyConfigurationRequest_REBOOT)
+				dryRunMode = applyResp.Messages[0].Mode.String()
 			}
 
 			return nil
 		},
 	)
 	if err != nil {
+		tflog.Debug(ctx, "handleRebootPrevention: dry-run failed, defaulting to auto",
+			map[string]interface{}{"error": err.Error()},
+		)
 		resp.Diagnostics.AddWarning(
 			"Cannot check reboot requirement",
 			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", planState.Node.ValueString(), err),
@@ -553,6 +612,13 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 
 		return
 	}
+
+	tflog.Debug(ctx, "handleRebootPrevention: dry-run completed",
+		map[string]interface{}{
+			"dry_run_mode": dryRunMode,
+			"needs_reboot": needsReboot,
+		},
+	)
 
 	if needsReboot {
 		setResolvedApplyMode(ctx, resp, "staged")

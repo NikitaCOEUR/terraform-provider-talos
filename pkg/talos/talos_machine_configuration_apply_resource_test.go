@@ -73,6 +73,7 @@ func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 			{
 				Config: testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged("talos", rName),
 				Check: resource.ComposeAggregateTestCheckFunc(
+					logApplyModeState(t, "AutoStaged - after create"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "id", "machine_configuration_apply"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "staged"),
@@ -320,8 +321,13 @@ func testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged(providerN
 
 	baseConfig := config.render()
 
+	// Note: .staged_if_needing_reboot depends on .this via implicit ordering
+	// because both use the same node address. Terraform should create .this first
+	// since it has the install disk config.
 	return baseConfig + `
 resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
+  depends_on = [talos_machine_configuration_apply.this]  # Explicit dependency for debugging
+
   client_configuration        = talos_machine_secrets.this.client_configuration
   machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
   node                        = libvirt_domain.cp.network_interface[0].addresses[0]

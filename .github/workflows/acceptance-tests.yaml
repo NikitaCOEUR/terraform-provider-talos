@@ -79,3 +79,36 @@ jobs:
           CI: "true"
         run: |
           make testacc # TESTS=TestAccTalosMachineConfigurationApplyResource
+
+      # DEBUG: Run staged tests separately with detailed output
+      - name: debug-staged-tests
+        if: always()
+        env:
+          TERRAFORM_LIBVIRT_TEST_DOMAIN_TYPE: qemu
+          LIBVIRT_DEFAULT_URI: qemu:///system
+          CI: "true"
+        run: |
+          echo "=== Running staged_if_needing_reboot debug tests ==="
+          make testacc-staged || true
+
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            testacc-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Show libvirt status on failure
+        if: failure()
+        run: |
+          echo "=== libvirt status ==="
+          sudo virsh list --all || true
+          echo "=== libvirt networks ==="
+          sudo virsh net-list --all || true
+          echo "=== libvirt pools ==="
+          sudo virsh pool-list --all || true
+          echo "=== dmesg (last 100 lines) ==="
+          sudo dmesg | tail -100 || true
