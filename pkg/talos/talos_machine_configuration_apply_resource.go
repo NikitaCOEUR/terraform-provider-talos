@@ -25,7 +25,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
-	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/action"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -229,16 +228,6 @@ func (p *talosMachineConfigurationApplyResource) Create(ctx context.Context, req
 
 	effectiveMode := getEffectiveMode(&state)
 
-	// Debug logging for staged_if_needing_reboot investigation
-	tflog.Debug(ctx, "Create: applying configuration",
-		map[string]interface{}{
-			"node":                state.Node.ValueString(),
-			"apply_mode":          state.ApplyMode.ValueString(),
-			"resolved_apply_mode": state.ResolvedApplyMode.ValueString(),
-			"effective_mode":      effectiveMode,
-		},
-	)
-
 	if err := retry.RetryContext(ctxDeadline, createTimeout, func() *retry.RetryError {
 		if err := talosClientOp(ctx, state.Endpoint.ValueString(), state.Node.ValueString(), talosClientConfig, func(nodeCtx context.Context, c *client.Client) error {
 			_, err := c.ApplyConfiguration(nodeCtx, &machineapi.ApplyConfigurationRequest{
@@ -318,16 +307,6 @@ func (p *talosMachineConfigurationApplyResource) Update(ctx context.Context, req
 	defer cancel()
 
 	effectiveMode := getEffectiveMode(&state)
-
-	// Debug logging for staged_if_needing_reboot investigation
-	tflog.Debug(ctx, "Update: applying configuration",
-		map[string]interface{}{
-			"node":                state.Node.ValueString(),
-			"apply_mode":          state.ApplyMode.ValueString(),
-			"resolved_apply_mode": state.ResolvedApplyMode.ValueString(),
-			"effective_mode":      effectiveMode,
-		},
-	)
 
 	if err := retry.RetryContext(ctxDeadline, updateTimeout, func() *retry.RetryError {
 		if err := talosClientOp(ctx, state.Endpoint.ValueString(), state.Node.ValueString(), talosClientConfig, func(nodeCtx context.Context, c *client.Client) error {
@@ -489,22 +468,11 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 	cfgBytes []byte,
 ) {
 	applyMode := strings.ToLower(planState.ApplyMode.ValueString())
-	if applyMode == "" || planState.ApplyMode.IsNull() || planState.ApplyMode.IsUnknown() {
+	if applyMode == "" {
 		applyMode = "auto"
 	}
 
-	tflog.Debug(ctx, "handleRebootPrevention: starting",
-		map[string]interface{}{
-			"node":       planState.Node.ValueString(),
-			"apply_mode": applyMode,
-			"is_create":  req.State.Raw.IsNull(),
-		},
-	)
-
 	if applyMode != "staged_if_needing_reboot" {
-		tflog.Debug(ctx, "handleRebootPrevention: not staged_if_needing_reboot, using apply_mode directly",
-			map[string]interface{}{"resolved_apply_mode": applyMode},
-		)
 		setResolvedApplyMode(ctx, resp, applyMode)
 
 		return
@@ -512,7 +480,6 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 
 	// Cannot perform dry-run if node address is unknown (computed from another resource)
 	if planState.Node.IsUnknown() {
-		tflog.Debug(ctx, "handleRebootPrevention: node is unknown, defaulting to auto")
 		setResolvedApplyMode(ctx, resp, "auto")
 
 		return
@@ -521,26 +488,13 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 	// For updates: avoid unnecessary dry-run if configuration hasn't changed
 	if !req.State.Raw.IsNull() {
 		var currentState talosMachineConfigurationApplyResourceModelV1
-
-		diags := req.State.Get(ctx, &currentState)
-		if diags.HasError() {
+		if diags := req.State.Get(ctx, &currentState); diags.HasError() {
 			return
 		}
 
-		configChanged := !currentState.MachineConfiguration.Equal(types.StringValue(string(cfgBytes)))
-		tflog.Debug(ctx, "handleRebootPrevention: checking config change for update",
-			map[string]interface{}{
-				"config_changed":              configChanged,
-				"current_resolved_apply_mode": currentState.ResolvedApplyMode.ValueString(),
-			},
-		)
-
 		if currentState.MachineConfiguration.Equal(types.StringValue(string(cfgBytes))) {
-			if !currentState.ResolvedApplyMode.IsNull() && currentState.ResolvedApplyMode.ValueString() != "" {
-				tflog.Debug(ctx, "handleRebootPrevention: config unchanged, reusing previous resolved_apply_mode",
-					map[string]interface{}{"resolved_apply_mode": currentState.ResolvedApplyMode.ValueString()},
-				)
-				setResolvedApplyMode(ctx, resp, currentState.ResolvedApplyMode.ValueString())
+			if resolvedMode := currentState.ResolvedApplyMode.ValueString(); resolvedMode != "" {
+				setResolvedApplyMode(ctx, resp, resolvedMode)
 
 				return
 			}
@@ -548,16 +502,11 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 	}
 
 	endpoint := planState.Endpoint.ValueString()
-	if endpoint == "" || planState.Endpoint.IsNull() || planState.Endpoint.IsUnknown() {
+	if endpoint == "" {
 		endpoint = planState.Node.ValueString()
 	}
 
-	tflog.Debug(ctx, "handleRebootPrevention: performing dry-run to check reboot requirement",
-		map[string]interface{}{
-			"node":     planState.Node.ValueString(),
-			"endpoint": endpoint,
-		},
-	)
+	nodeAddr := planState.Node.ValueString()
 
 	talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 		"dynamic",
@@ -566,12 +515,9 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 		planState.ClientConfiguration.Key.ValueString(),
 	)
 	if err != nil {
-		tflog.Debug(ctx, "handleRebootPrevention: failed to create client config, defaulting to auto",
-			map[string]interface{}{"error": err.Error()},
-		)
 		resp.Diagnostics.AddWarning(
 			"Cannot check reboot requirement",
-			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", planState.Node.ValueString(), err),
+			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", nodeAddr, err),
 		)
 		setResolvedApplyMode(ctx, resp, "auto")
 
@@ -579,9 +525,8 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 	}
 
 	var needsReboot bool
-	var dryRunMode string
 
-	err = talosClientOp(ctx, endpoint, planState.Node.ValueString(), talosClientConfig,
+	err = talosClientOp(ctx, endpoint, nodeAddr, talosClientConfig,
 		func(nodeCtx context.Context, c *client.Client) error {
 			applyResp, applyErr := c.ApplyConfiguration(nodeCtx, &machineapi.ApplyConfigurationRequest{
 				Mode:   machineapi.ApplyConfigurationRequest_AUTO,
@@ -592,44 +537,49 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 				return applyErr
 			}
 
-			if len(applyResp.Messages) > 0 {
-				needsReboot = (applyResp.Messages[0].Mode == machineapi.ApplyConfigurationRequest_REBOOT)
-				dryRunMode = applyResp.Messages[0].Mode.String()
+			if len(applyResp.Messages) == 0 {
+				return nil
 			}
+
+			msg := applyResp.Messages[0]
+			// In maintenance mode, the dry-run returns Mode=REBOOT (default value 0)
+			// but this doesn't mean a reboot is actually needed - the node just doesn't
+			// have a config yet. We detect maintenance mode but still use the Mode value
+			// to decide: if Mode=REBOOT, we use "staged" to be safe.
+			// The actual apply will work because by then, another resource (like .this)
+			// will have applied the initial config and the node will be out of maintenance mode.
+			needsReboot = msg.Mode == machineapi.ApplyConfigurationRequest_REBOOT
 
 			return nil
 		},
 	)
 	if err != nil {
-		tflog.Debug(ctx, "handleRebootPrevention: dry-run failed, defaulting to auto",
-			map[string]interface{}{"error": err.Error()},
-		)
 		resp.Diagnostics.AddWarning(
 			"Cannot check reboot requirement",
-			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", planState.Node.ValueString(), err),
+			fmt.Sprintf("Node %s: %v. Using 'auto' mode (may reboot).", nodeAddr, err),
 		)
 		setResolvedApplyMode(ctx, resp, "auto")
 
 		return
 	}
 
-	tflog.Debug(ctx, "handleRebootPrevention: dry-run completed",
-		map[string]interface{}{
-			"dry_run_mode": dryRunMode,
-			"needs_reboot": needsReboot,
-		},
-	)
-
-	if needsReboot {
-		setResolvedApplyMode(ctx, resp, "staged")
-		resp.Diagnostics.AddWarning(
-			"Reboot prevented - using staged mode",
-			fmt.Sprintf("Node %s: Configuration requires reboot. Using 'staged' mode. Manually reboot with: talosctl reboot --nodes %s",
-				planState.Node.ValueString(), planState.Node.ValueString()),
-		)
-	} else {
+	// In maintenance mode, STAGED is not supported by the API, but we still set
+	// resolved_apply_mode to "staged" during plan. The actual apply will succeed
+	// because by the time our resource is applied, another resource (with depends_on)
+	// will have already applied the initial config and the node will be out of
+	// maintenance mode.
+	if !needsReboot {
 		setResolvedApplyMode(ctx, resp, "auto")
+
+		return
 	}
+
+	setResolvedApplyMode(ctx, resp, "staged")
+	resp.Diagnostics.AddWarning(
+		"Reboot prevented - using staged mode",
+		fmt.Sprintf("Node %s: Configuration requires reboot. Using 'staged' mode. Manually reboot with: talosctl reboot --nodes %s",
+			nodeAddr, nodeAddr),
+	)
 }
 
 func (p *talosMachineConfigurationApplyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) { //nolint:gocyclo,cyclop

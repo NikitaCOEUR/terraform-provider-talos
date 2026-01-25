@@ -30,7 +30,7 @@ testacc-debug:
 # Run specific upgrade tests to debug staged_if_needing_reboot behavior
 .PHONY: testacc-staged
 testacc-staged:
-	TF_CLI_CONFIG_FILE="thisfiledoesnotexist" TF_ACC=1 go test -v -failfast -cover -timeout=40m \
+	TF_LOG=DEBUG TF_CLI_CONFIG_FILE="thisfiledoesnotexist" TF_ACC=1 go test -v -failfast -cover -timeout=40m \
 		-run='TestAccTalosMachineConfigurationApplyResourceAutoStaged|TestAccTalosMachineConfigurationApplyResourceUpgradeWithFix|TestAccTalosMachineConfigurationApplyResourceUpgradeWithBug' \
 		$(RUNARGS) ./pkg/talos/ 2>&1 | tee testacc-staged.log
 
@@ -47,6 +47,7 @@ testacc-upgradefix-debug:
 	TF_LOG=DEBUG TF_CLI_CONFIG_FILE="thisfiledoesnotexist" TF_ACC=1 go test -v -failfast -timeout=40m \
 		-run='TestAccTalosMachineConfigurationApplyResourceUpgradeWithFix$$' \
 		$(RUNARGS) ./pkg/talos/ 2>&1 | tee testacc-upgradefix.log
+
 
 .PHONY: check-dirty
 check-dirty: generate ## Verifies that source tree is not dirty

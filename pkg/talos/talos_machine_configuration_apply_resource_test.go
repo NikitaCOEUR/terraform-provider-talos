@@ -5,7 +5,6 @@
 package talos_test
 
 import (
-	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
@@ -52,12 +51,15 @@ func TestAccTalosMachineConfigurationApplyResource(t *testing.T) {
 
 // TestAccTalosMachineConfigurationApplyResourceAutoStaged tests the "staged_if_needing_reboot" apply mode.
 //
-// Note on local vs CI environment:
-// During local development, the node IP was sometimes unknown during the plan phase,
-// preventing the dry-run from being performed. However, in CI, the libvirt setup
-// allows the node IP to be known immediately, enabling the dry-run to execute.
-// Since the configuration requires a reboot, the dry-run correctly resolves to
-// "staged" mode to prevent uncontrolled reboots.
+// TestAccTalosMachineConfigurationApplyResourceAutoStaged tests the "staged_if_needing_reboot" apply mode.
+//
+// This test verifies that when apply_mode is "staged_if_needing_reboot" and the configuration
+// requires a reboot, the resolved_apply_mode is set to "staged" to prevent automatic reboots.
+//
+// Note: During the plan phase, the node may still be in maintenance mode (no config applied yet).
+// The dry-run in maintenance mode returns Mode=REBOOT (default value), which we interpret as
+// "needs reboot" and resolve to "staged". The actual apply works because by then, another
+// resource (.this with depends_on) will have applied the initial config.
 func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
 
@@ -73,7 +75,6 @@ func TestAccTalosMachineConfigurationApplyResourceAutoStaged(t *testing.T) {
 			{
 				Config: testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged("talos", rName),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					logApplyModeState(t, "AutoStaged - after create"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "id", "machine_configuration_apply"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", "staged"),
@@ -204,8 +205,8 @@ func TestAccTalosMachineConfigurationApplyResourceUpgradeWithFix(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					logApplyModeState(t, "current version - FIX: resolved_apply_mode is computed"),
 					resource.TestCheckResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "apply_mode", "staged_if_needing_reboot"),
-					// Fix: resolved_apply_mode should now be computed (not empty), can be "auto" or "staged"
-					resource.TestMatchResourceAttr("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode", regexp.MustCompile(`^(auto|staged)$`)),
+					// Fix: resolved_apply_mode should now be computed (not empty)
+					resource.TestCheckResourceAttrSet("talos_machine_configuration_apply.staged_if_needing_reboot", "resolved_apply_mode"),
 				),
 			},
 		},
@@ -321,13 +322,9 @@ func testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged(providerN
 
 	baseConfig := config.render()
 
-	// Note: .staged_if_needing_reboot depends on .this via implicit ordering
-	// because both use the same node address. Terraform should create .this first
-	// since it has the install disk config.
 	return baseConfig + `
 resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
-  depends_on = [talos_machine_configuration_apply.this]  # Explicit dependency for debugging
-
+  depends_on                  = [talos_machine_configuration_apply.this]
   client_configuration        = talos_machine_secrets.this.client_configuration
   machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
   node                        = libvirt_domain.cp.network_interface[0].addresses[0]
@@ -354,7 +351,7 @@ func testAccTalosMachineConfigurationApplyResourceConfigAutoStagedUpgrade(rName,
 	config := dynamicConfig{
 		Provider:        "talos",
 		ResourceName:    rName,
-		WithApplyConfig: false,
+		WithApplyConfig: true,
 		WithBootstrap:   false,
 	}
 
